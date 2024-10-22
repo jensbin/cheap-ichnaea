@@ -7,7 +7,7 @@ With the retirement of the Mozilla Location Service
 to Google Location Service.
 
 I don't need accurate location data for timezone, the
-[ip-api](https://ip-api.com service) service suits well enough.
+[ip-api.com](https://ip-api.com) service service suits well enough.
 So I build this local service.
 
 # How to use it?

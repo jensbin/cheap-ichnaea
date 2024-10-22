@@ -5,16 +5,10 @@
 }:
 let
   fs = lib.fileset;
-  # sourceFiles = ./.;
-  # sourceFiles = fs.gitTracked ./.;
   sourceFiles = fs.unions [
     ./Cargo.toml
     ./Cargo.lock
     ./src/main.rs
-    # (fs.fileFilter
-    #   (file: file.hasExt "rs")
-    #   ./src
-    # )
   ];
 in
 rustPlatform.buildRustPackage {
@@ -39,18 +33,8 @@ rustPlatform.buildRustPackage {
     openssl
   ];
 
-  installPhase = ''
-    runHook preInstall
-
-    find .
-    install -D -t $out/bin target/x86_64-unknown-linux-gnu/release/cheap-ichnaea
-
-    runHook postInstall
-  '';
-  #doCheck = false;
-
   meta = with lib; {
-    description = "Cheap ichnaea service";
+    description = "Mimics the ichnaea geolocate v1 API";
     license = licenses.mit;
   };
 }

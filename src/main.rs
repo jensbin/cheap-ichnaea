@@ -96,7 +96,7 @@ fn extract_ipapi(json_str: &str) -> Option<(String, f64, f64)> {
     Some((country, lat, lon))
 }
 
-// Function to fetch URL with retries and exponential backoff
+// Function to fetch URL with retries and backoff
 async fn fetch_url_with_retry(url: &str, max_retries: u32, retry_interval: u64) -> Result<String, reqwest::Error> {
     let mut retries = 0;
     let mut wait_interval = retry_interval;
@@ -116,7 +116,8 @@ async fn fetch_url_with_retry(url: &str, max_retries: u32, retry_interval: u64) 
 
                 warn!("Failed to fetch URL (attempt {}/{}): {}. Retrying in {} seconds...", retries, max_retries, err, wait_interval);
                 task::sleep(std::time::Duration::from_secs(wait_interval)).await;
-                wait_interval *= 2; // Exponential backoff
+                wait_interval = (wait_interval as f64 * 1.3) as u64;
+                // wait_interval *= 2; // Exponential backoff
             }
         }
     }
@@ -286,15 +287,15 @@ async fn main() -> std::io::Result<()> {
     };
     let args = Args::parse();
 
-    let cache = web::Data::new(std::sync::Mutex::new(CountryCache::new(args.ttl_cache))); 
+    let cache = web::Data::new(std::sync::Mutex::new(CountryCache::new(args.ttl_cache)));
 
     HttpServer::new(move || {
         App::new()
             .app_data(cache.clone())
             .service(web::resource("/v1/geolocate")
                 .route(web::post().to(geolocate)))
-    }).workers(2)
-    .bind(&format!("127.0.0.1:{}", args.port))?
+    }).workers(3)
+    .bind(("localhost", args.port))?
     .run()
     .await
 }

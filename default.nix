@@ -13,7 +13,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "cheap-ichnaea";
-  version = "0.2.2";
+  version = "0.2.3";
 
   src = fs.toSource {
     root = ./.;

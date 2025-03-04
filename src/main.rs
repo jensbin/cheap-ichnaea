@@ -8,7 +8,8 @@ use log::{info, warn, debug, error};
 use env_logger::Env;
 use std::time::{Duration, SystemTime};
 use std::collections::HashMap;
-use async_std::task;
+use std::sync::{Arc, RwLock};
+use tokio::time;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Location {
@@ -17,9 +18,16 @@ struct Location {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Response {
+struct LocationResponse {
     location: Location,
     accuracy: f64,
+    fallback: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CountryResponse {
+    country_code: String,
+    country_name: String,
     fallback: String,
 }
 
@@ -45,7 +53,8 @@ struct ErrorInfo {
 // Cache entry struct
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    cc: String,
+    country_code: String,
+    country_name: String,
     coordinates: (f64, f64), // (latitude, longitude)
     timestamp: SystemTime,
 }
@@ -65,38 +74,74 @@ impl CountryCache {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<CacheEntry> {
+    fn get(&self, key: &str) -> Option<CacheEntry> {
         // Check if the key exists in the cache and is still valid
         if let Some(entry) = self.cache.get(key) {
             let now = SystemTime::now();
             if now.duration_since(entry.timestamp).unwrap() < self.ttl {
                 // Cache hit and valid
                 return Some(entry.clone());
-            } else {
-                // Cache hit but expired, remove it
-                self.cache.remove(key);
-            }
+            } 
         }
-        // Cache miss
+        // Cache miss or expired
         None
     }
 
     fn insert(&mut self, key: String, value: CacheEntry) {
         self.cache.insert(key, value);
     }
+
+    fn clear_expired(&mut self) {
+        let now = SystemTime::now();
+        self.cache.retain(|_, v| now.duration_since(v.timestamp).unwrap() < self.ttl);
+    }
 }
 
-// http://ip-api.com/json/?fields=status,message,country,countryCode,lat,lon
-// {"status":"success","country":"Switzerland","countryCode":"CH","lat":47.000,"lon":8.000}
-fn extract_ipapi(json_str: &str) -> Option<(String, f64, f64)> {
+async fn fetch_location() -> Option<(String, String, f64, f64)> {
+    let location_result = fetch_url_with_retry("http://ip-api.com/json/?fields=status,message,country,countryCode,lat,lon", 6, 30).await;
+
+    match location_result {
+        Ok(response) => extract_ipapi(&response),
+        Err(_) => {
+            error!("Failed to fetch location after retries");
+            None
+        }
+    }
+}
+
+async fn update_location_loop(cache: Arc<RwLock<CountryCache>>) {
+    loop {
+        let ttl = cache.read().unwrap().ttl;
+        if let Some((country_code, country_name, latitude, longitude)) = fetch_location().await {
+            if country_code.len() == 2 && latitude != 0.0 && longitude != 0.0 {
+                let cache_entry = CacheEntry {
+                    country_code: country_code.clone(),
+                    country_name: country_name.clone(),
+                    coordinates: (latitude, longitude),
+                    timestamp: SystemTime::now(),
+                };
+                cache.write().unwrap().insert("location".to_string(), cache_entry);
+                info!("Updated location cache: {} ({}, {})", country_code, latitude, longitude);
+            }
+        }
+        time::sleep(ttl).await;
+
+        // Clear expired entries after each update
+        cache.write().unwrap().clear_expired();
+    }
+}
+
+fn extract_ipapi(json_str: &str) -> Option<(String, String, f64, f64)> {
     let json: Value = serde_json::from_str(json_str).ok()?;
-    let country = json["countryCode"].as_str().unwrap_or("").to_string();
+
+    let country_code = json["countryCode"].as_str().map_or_else(String::new, String::from);
+    let country_name = json["country"].as_str().map_or_else(String::new, String::from);
     let lat: f64 = json["lat"].as_f64().unwrap_or(0.0);
     let lon: f64 = json["lon"].as_f64().unwrap_or(0.0);
-    Some((country, lat, lon))
+    Some((country_code, country_name, lat, lon))
 }
 
-// Function to fetch URL with retries and backoff
+
 async fn fetch_url_with_retry(url: &str, max_retries: u32, retry_interval: u64) -> Result<String, reqwest::Error> {
     let mut retries = 0;
     let mut wait_interval = retry_interval;
@@ -115,9 +160,8 @@ async fn fetch_url_with_retry(url: &str, max_retries: u32, retry_interval: u64) 
                 }
 
                 warn!("Failed to fetch URL (attempt {}/{}): {}. Retrying in {} seconds...", retries, max_retries, err, wait_interval);
-                task::sleep(std::time::Duration::from_secs(wait_interval)).await;
+                time::sleep(Duration::from_secs(wait_interval)).await;
                 wait_interval = (wait_interval as f64 * 1.3) as u64;
-                // wait_interval *= 2; // Exponential backoff
             }
         }
     }
@@ -126,7 +170,6 @@ async fn fetch_url_with_retry(url: &str, max_retries: u32, retry_interval: u64) 
 pub async fn fetch_url(url: &str) -> Result<String, reqwest::Error> {
     debug!("Fetching URL: {}", url);
     let response = reqwest::get(url).await?;
-    // info!("Successfully fetched URL");
     Ok(response.text().await?)
 }
 
@@ -203,63 +246,67 @@ struct WifiAccessPoints {
 }
 
 // Define the get_location function to handle POST requests
-async fn geolocate(_data: Option<web::Json<PostData>>, cache: web::Data<std::sync::Mutex<CountryCache>>) -> impl Responder {
+async fn geolocate(cache: web::Data<Arc<RwLock<CountryCache>>>) -> impl Responder {
+    let cache = cache.read().unwrap();
 
-    let mut cache = cache.lock().unwrap(); 
-
-    let (latitude, longitude) = match cache.get("location") {
+    match cache.get("location") {
         Some(cached_entry) => {
-            info!("Cache hit for location ({})", cached_entry.cc);
-            (cached_entry.coordinates.0, cached_entry.coordinates.1)
+            info!("Cache hit for location ({})", cached_entry.country_code);
+            let response = LocationResponse {
+                location: Location { lat: cached_entry.coordinates.0, lng: cached_entry.coordinates.1 },
+                accuracy: 600000.0,
+                fallback: "ipf".to_string(),
+            };
+            HttpResponse::Ok().json(response)
         },
         None => {
-            info!("Cache miss for location");
-
-            let location_result = fetch_url_with_retry("http://ip-api.com/json/?fields=status,message,country,countryCode,lat,lon", 6, 30).await;
-
-            let (location, latitude, longitude) = match location_result {
-                Ok(response) => extract_ipapi(&response).unwrap_or_else(|| ("Unknown".to_string(), 0.0, 0.0)),
-                Err(_) => {
-                    error!("Failed to fetch location after retries");
-                    ("Unknown".to_string(), 0.0, 0.0)
+            info!("Location unknown");
+            let error_response = ErrorResponse {
+                error: ErrorDetail {
+                    errors: vec![ErrorInfo {
+                        domain: "geolocation".to_string(),
+                        reason: "notFound".to_string(),
+                        message: "Not found".to_string(),
+                    }],
+                    code: 404,
+                    message: "Not found".to_string(),
                 }
             };
-            info!("Found coordinates for {}: ({}, {})", location, latitude, longitude);
+            HttpResponse::NotFound().json(error_response)
 
-            if location.len() == 2 && latitude != 0.0 && longitude != 0.0 {
-                let cache_entry = CacheEntry {
-                    cc: location.clone(),
-                    coordinates: (latitude, longitude),
-                    timestamp: SystemTime::now(),
-                };
-                cache.insert("location".to_string(), cache_entry);
-            }
-
-            (latitude, longitude)
         }
-    };
+    }
+}
 
-    if latitude == 0.0 && longitude == 0.0 {
-        // Return 404 with error message
-        let error_response = ErrorResponse {
-            error: ErrorDetail {
-                errors: vec![ErrorInfo {
-                    domain: "geolocation".to_string(),
-                    reason: "notFound".to_string(),
+async fn country(cache: web::Data<Arc<RwLock<CountryCache>>>) -> impl Responder {
+    let cache = cache.read().unwrap();
+
+    match cache.get("location") {
+        Some(cached_entry) => {
+            info!("Cache hit for country ({})", cached_entry.country_code);
+            let response = CountryResponse {
+                country_code: cached_entry.country_code,
+                country_name: cached_entry.country_name,
+                fallback: "ipf".to_string(),
+            };
+            HttpResponse::Ok().json(response)
+        }
+        None => {
+            info!("Country unknown");
+
+            let error_response = ErrorResponse {
+                error: ErrorDetail {
+                   errors: vec![ErrorInfo {
+                       domain: "geolocation".to_string(),
+                       reason: "notFound".to_string(),
+                        message: "Not found".to_string(),
+                    }],
+                    code: 404,
                     message: "Not found".to_string(),
-                }],
-                code: 404,
-                message: "Not found".to_string(),
-            }
-        };
-        return HttpResponse::NotFound().json(error_response);
-    } else {
-        let response = Response {
-            location: Location { lat: latitude, lng: longitude },
-            accuracy: 600000.0,
-            fallback: "ipf".to_string(),
-        };
-        return HttpResponse::Ok().json(response);
+               }
+           };
+           HttpResponse::NotFound().json(error_response)
+        }
     }
 }
 
@@ -287,14 +334,22 @@ async fn main() -> std::io::Result<()> {
     };
     let args = Args::parse();
 
-    let cache = web::Data::new(std::sync::Mutex::new(CountryCache::new(args.ttl_cache)));
+    let cache = Arc::new(RwLock::new(CountryCache::new(args.ttl_cache)));
+    let cloned_cache = cache.clone();
+
+
+    tokio::spawn(async move {
+        update_location_loop(cloned_cache).await;
+    });
+
 
     HttpServer::new(move || {
         App::new()
-            .app_data(cache.clone())
-            .service(web::resource("/v1/geolocate")
-                .route(web::post().to(geolocate)))
-    }).workers(3)
+            .app_data(web::Data::new(cache.clone()))
+            .service(web::resource("/v1/geolocate").route(web::post().to(geolocate)))
+            .service(web::resource("/v1/country").route(web::post().to(country)))
+    })
+    .workers(3)
     .bind(("localhost", args.port))?
     .run()
     .await

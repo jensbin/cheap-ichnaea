@@ -90,7 +90,7 @@ impl CountryCache {
 }
 
 async fn fetch_location() -> Option<(String, String, f64, f64)> {
-    let location_result = fetch_url_with_retry("http://ip-api.com/json/?fields=status,message,country,countryCode,lat,lon", 6, 30).await;
+    let location_result = fetch_url_with_retry("http://ip-api.com/json/?fields=country,countryCode,lat,lon", 6, 30).await;
 
     match location_result {
         Ok(response) => extract_ipapi(&response),

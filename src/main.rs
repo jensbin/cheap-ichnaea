@@ -62,38 +62,30 @@ struct CacheEntry {
 // Implement a simple in-memory cache with a configurable TTL
 #[derive(Debug)]
 struct CountryCache {
-    cache: HashMap<String, CacheEntry>,
+    cache: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
 }
 
 impl CountryCache {
     fn new(ttl_seconds: u64) -> Self {
         CountryCache {
-            cache: HashMap::new(),
+            cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(ttl_seconds),
         }
     }
 
     fn get(&self, key: &str) -> Option<CacheEntry> {
-        // Check if the key exists in the cache and is still valid
-        if let Some(entry) = self.cache.get(key) {
-            let now = SystemTime::now();
-            if now.duration_since(entry.timestamp).unwrap() < self.ttl {
-                // Cache hit and valid
-                return Some(entry.clone());
-            } 
-        }
-        // Cache miss or expired
-        None
+        let cache = self.cache.read().unwrap();
+        cache.get(key).cloned()
     }
 
-    fn insert(&mut self, key: String, value: CacheEntry) {
-        self.cache.insert(key, value);
+    fn insert(&self, key: String, value: CacheEntry) {
+        let mut cache = self.cache.write().unwrap();
+        cache.insert(key, value);
     }
 
-    fn clear_expired(&mut self) {
-        let now = SystemTime::now();
-        self.cache.retain(|_, v| now.duration_since(v.timestamp).unwrap() < self.ttl);
+    fn is_expired(&self, entry: &CacheEntry) -> bool {
+        SystemTime::now().duration_since(entry.timestamp).unwrap() >= self.ttl
     }
 }
 
@@ -109,26 +101,35 @@ async fn fetch_location() -> Option<(String, String, f64, f64)> {
     }
 }
 
-async fn update_location_loop(cache: Arc<RwLock<CountryCache>>) {
-    loop {
-        let ttl = cache.read().unwrap().ttl;
-        if let Some((country_code, country_name, latitude, longitude)) = fetch_location().await {
-            if country_code.len() == 2 && latitude != 0.0 && longitude != 0.0 {
-                let cache_entry = CacheEntry {
-                    country_code: country_code.clone(),
-                    country_name: country_name.clone(),
-                    coordinates: (latitude, longitude),
-                    timestamp: SystemTime::now(),
-                };
-                cache.write().unwrap().insert("location".to_string(), cache_entry);
-                info!("Updated location cache: {} ({}, {})", country_code, latitude, longitude);
-            }
+async fn update_location(cache: web::Data<Arc<CountryCache>>) {
+    if let Some((country_code, country_name, latitude, longitude)) = fetch_location().await {
+        if country_code.len() == 2 && latitude != 0.0 && longitude != 0.0 {
+            let cache_entry = CacheEntry {
+                country_code: country_code.clone(),
+                country_name: country_name.clone(),
+                coordinates: (latitude, longitude),
+                timestamp: SystemTime::now(),
+            };
+            cache.insert("location".to_string(), cache_entry);
+            info!("Updated location cache: {} ({}, {})", country_code, latitude, longitude);
+        } else {
+            error!("Invalid location data received"); // Log an error for invalid data
         }
-        time::sleep(ttl).await;
-
-        // Clear expired entries after each update
-        cache.write().unwrap().clear_expired();
+    } else {
+        error!("Failed to fetch location data"); // Log an error for fetch failure
     }
+}
+
+async fn background_update(cache: web::Data<Arc<CountryCache>>) {
+    // Initial update
+    update_location(cache.clone()).await;
+
+    // // Periodically update
+    // let ttl = cache.ttl.clone();
+    // loop {
+    //     tokio::time::sleep(ttl).await;
+    //     update_location(cache.clone()).await;
+    // }
 }
 
 fn extract_ipapi(json_str: &str) -> Option<(String, String, f64, f64)> {
@@ -245,13 +246,16 @@ struct WifiAccessPoints {
     signal_to_noise_ratio: u32,
 }
 
-// Define the get_location function to handle POST requests
-async fn geolocate(cache: web::Data<Arc<RwLock<CountryCache>>>) -> impl Responder {
-    let cache = cache.read().unwrap();
-
+async fn geolocate(cache: web::Data<Arc<CountryCache>>) -> impl Responder {
     match cache.get("location") {
         Some(cached_entry) => {
-            info!("Cache hit for location ({})", cached_entry.country_code);
+            if cache.is_expired(&cached_entry) {
+                info!("Delivering expired cache hit for location ({})", cached_entry.country_code);
+                tokio::spawn(update_location(cache.clone()));
+            } else {
+                info!("Delivering cache hit for location ({})", cached_entry.country_code);
+            }
+
             let response = LocationResponse {
                 location: Location { lat: cached_entry.coordinates.0, lng: cached_entry.coordinates.1 },
                 accuracy: 600000.0,
@@ -278,12 +282,16 @@ async fn geolocate(cache: web::Data<Arc<RwLock<CountryCache>>>) -> impl Responde
     }
 }
 
-async fn country(cache: web::Data<Arc<RwLock<CountryCache>>>) -> impl Responder {
-    let cache = cache.read().unwrap();
-
+async fn country(cache: web::Data<Arc<CountryCache>>) -> impl Responder {
     match cache.get("location") {
         Some(cached_entry) => {
-            info!("Cache hit for country ({})", cached_entry.country_code);
+            if cache.is_expired(&cached_entry) {
+                info!("Delivering expired cache hit for country ({})", cached_entry.country_code);
+                tokio::spawn(update_location(cache.clone()));
+            } else {
+                info!("Delivering cache hit for country ({})", cached_entry.country_code);
+            }
+
             let response = CountryResponse {
                 country_code: cached_entry.country_code,
                 country_name: cached_entry.country_name,
@@ -334,18 +342,18 @@ async fn main() -> std::io::Result<()> {
     };
     let args = Args::parse();
 
-    let cache = Arc::new(RwLock::new(CountryCache::new(args.ttl_cache)));
-    let cloned_cache = cache.clone();
-
+    let cache = Arc::new(CountryCache::new(args.ttl_cache));
+    let cloned_cache = web::Data::new(cache);
+    let background_cache = cloned_cache.clone();
 
     tokio::spawn(async move {
-        update_location_loop(cloned_cache).await;
+        background_update(background_cache).await;
     });
 
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::new(cache.clone()))
+            .app_data(cloned_cache.clone())
             .service(web::resource("/v1/geolocate").route(web::post().to(geolocate)))
             .service(web::resource("/v1/country").route(web::post().to(country)))
     })
